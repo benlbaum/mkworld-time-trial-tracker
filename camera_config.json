@@ -1,0 +1,34 @@
+{
+  "camera_index": 0,
+  "camera_name": "Lenovo FHD Webcam",
+  "camera_resolution": [
+    1920,
+    1080
+  ],
+  "preview_resolution": [
+    1280,
+    720
+  ],
+  "resolution_scale_factor": 1.5,
+  "crop_corners": [
+    [
+      857,
+      349
+    ],
+    [
+      1036,
+      333
+    ],
+    [
+      1038,
+      369
+    ],
+    [
+      860,
+      383
+    ]
+  ],
+  "zoom_level": 6.589622641509434,
+  "pan_x": -36.63657407407413,
+  "pan_y": 443.2361111111113
+}

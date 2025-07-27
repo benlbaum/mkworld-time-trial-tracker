@@ -4,7 +4,9 @@ import cv2
 import tkinter as tk
 from tkinter import ttk, messagebox
 from threading import Thread
-from typing import Optional
+from typing import Optional, Tuple, List
+import numpy as np
+import json
 
 from PIL import Image, ImageTk
 from pygrabber.dshow_graph import FilterGraph
@@ -16,76 +18,287 @@ class CameraSetup:
         self.capture: Optional[cv2.VideoCapture] = None
         self.preview_running = False
         self._preview_image = None
-        self._needs_redraw = False
+        
+        # Camera resolution tracking
+        self.camera_resolution = (640, 480)  # Will be updated when camera opens
+        self.preview_resolution = (1280, 720)  # Lower resolution for smooth preview
+        self.resolution_scale_factor = 1.0  # Scale factor from preview to full resolution
 
         self.zoom_level = 1.0
-        self.pan_x = 0
-        self.pan_y = 0
+        self.pan_x = 0  # Pan offset in canvas pixels
+        self.pan_y = 0  # Pan offset in canvas pixels
+        
+        # Image display properties
+        self.image_scale = 1.0  # Current scale factor for the image
+        self.image_width = 0    # Scaled image width
+        self.image_height = 0   # Scaled image height
+        self.image_x = 0        # Image position on canvas
+        self.image_y = 0        # Image position on canvas
+
+        # Configuration file path
+        self.config_file = "camera_config.json"
 
         self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Camera Setup")
-        self.dialog.geometry("1200x900")
+        self.dialog.title("Camera Setup - Timer Crop")
+        self.dialog.geometry("1400x900")
         self.dialog.minsize(400, 300)
         self.dialog.resizable(True, True)
         self.dialog.grab_set()
         self.dialog.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        
         graph = FilterGraph()
-        self.camera_names = graph.get_input_devices()  # List of camera names
-        self.camera_options = list(range(len(self.camera_names)))  # List of corresponding indices
+        self.camera_names = graph.get_input_devices()
+        self.camera_options = list(range(len(self.camera_names)))
 
+        # Camera selection frame with resolution info
+        camera_frame = ttk.Frame(self.dialog)
+        camera_frame.pack(padx=10, pady=10, fill=tk.X)
+        
         self.device_var = tk.StringVar()
         self.device_dropdown = ttk.Combobox(
-            self.dialog,
+            camera_frame,
             textvariable=self.device_var,
             state="readonly",
-            width=30  # adjust this value for width; default is ~20
+            width=30
         )
         self.device_dropdown["values"] = [
             f"{name} (Camera {i})" for i, name in enumerate(self.camera_names)
         ]
+        
+        # Set default selection (will be overridden by config if available)
         self.device_dropdown.current(0)
-        self.device_dropdown.pack(padx=10, pady=10)
-
-        self.camera_aspect_ratio = 4 / 3
+        self.device_dropdown.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Resolution info label
+        self.resolution_label = ttk.Label(camera_frame, text="Resolution: Unknown", foreground="blue")
+        self.resolution_label.pack(side=tk.LEFT)
 
         self.canvas = tk.Canvas(self.dialog, bg="black")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
-        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
-        self.canvas.bind("<ButtonPress-1>", self.on_mouse_press)
+        
+        # Mouse bindings for corner adjustment
+        self.canvas.bind("<ButtonPress-1>", self.on_mouse_press_left)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag_left)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_release_left)
+
+        # Pan with middle mouse button or right mouse button
+        self.canvas.bind("<ButtonPress-2>", self.on_mouse_press_middle)
+        self.canvas.bind("<B2-Motion>", self.on_mouse_drag_middle)
+        self.canvas.bind("<ButtonRelease-2>", self.on_mouse_release_middle)
+        self.canvas.bind("<ButtonPress-3>", self.on_mouse_press_middle)
+        self.canvas.bind("<B3-Motion>", self.on_mouse_drag_middle)
+        self.canvas.bind("<ButtonRelease-3>", self.on_mouse_release_middle)
 
         self.canvas_size = (640, 360)
         self.drag_start = (0, 0)
+        self.current_drag_end = None  # For live preview during creation
 
-        self.zoom_slider = ttk.Scale(self.dialog, from_=1.0, to=3.0, value=1.0, orient="horizontal", command=self.on_zoom_slider)
-        self.zoom_slider.pack(fill=tk.X, padx=10, pady=5)
+        # 4-corner crop system
+        self.corner_points = None  # [(x1,y1), (x2,y2), (x3,y3), (x4,y4)] in original image coordinates
+        self.canvas_corners = None  # Corner positions in canvas coordinates
+        self.selected_corner = None  # Which corner is being dragged
+        self.corner_radius = 8  # Radius for corner selection
+        self.crop_mode = "none"  # "none", "creating", "adjusting"
 
-        zoom_hint = ttk.Label(self.dialog, text="Scroll or use slider to zoom. Click and drag to pan.", foreground="gray")
-        zoom_hint.pack()
+        # Zoom controls
+        zoom_frame = ttk.Frame(self.dialog)
+        zoom_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(zoom_frame, text="Zoom:").pack(side=tk.LEFT)
+        self.zoom_slider = ttk.Scale(zoom_frame, from_=1.0, to=10.0, value=1.0, orient="horizontal", command=self.on_zoom_slider)
+        self.zoom_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 10))
+        
+        self.zoom_label = ttk.Label(zoom_frame, text="100%", width=6)
+        self.zoom_label.pack(side=tk.RIGHT)
+
+        instruction_text = ("Instructions:\n"
+                          "1. Scroll or use slider to zoom, middle-click drag to pan\n"
+                          "2. Left-click and drag to create initial timer crop area\n"
+                          "3. Drag the corner circles to adjust perspective around timer\n"
+                          "4. Preview shows perspective-corrected timer\n"
+                          "5. Settings are automatically saved and restored")
+        
+        instructions = ttk.Label(self.dialog, text=instruction_text, foreground="gray", justify="left")
+        instructions.pack(padx=10, pady=5)
+
+        # Crop preview frame with fixed size
+        crop_frame = ttk.LabelFrame(self.dialog, text="Timer Preview (Perspective Corrected)", padding=10)
+        crop_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Create a frame with fixed dimensions for the preview
+        preview_container = ttk.Frame(crop_frame, width=400, height=200)
+        preview_container.pack_propagate(False)
+        preview_container.pack()
+        
+        self.crop_preview = ttk.Label(preview_container, text="Draw crop area around timer", background="black", foreground="white")
+        self.crop_preview.pack(fill=tk.BOTH, expand=True)
 
         button_frame = ttk.Frame(self.dialog)
         button_frame.pack(pady=10)
+        ttk.Button(button_frame, text="Clear Crop", command=self.clear_crop).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Reset to Rectangle", command=self.reset_to_rectangle).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Save Config", command=self.save_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Load Config", command=self.load_and_apply_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Debug Resolution", command=self.debug_current_camera).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Next: OCR Setup", command=self.on_next_ocr).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Select", command=self.on_select).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Cancel", command=self.on_cancel).pack(side=tk.LEFT, padx=5)
 
         self.device_dropdown.bind("<<ComboboxSelected>>", lambda e: self.start_preview())
+        
+        # Load saved configuration after UI is fully set up
+        saved_config = self.load_config()
+        if saved_config:
+            self.apply_saved_config(saved_config)
+            
         self.start_preview()
 
-    def validate_camera_indices(self, names: list[str]) -> list[int]:
-        """Optional: confirm camera indices work with OpenCV"""
-        valid_indices = []
-        for i in range(len(names)):
-            cap = cv2.VideoCapture(i)
-            if cap is not None and cap.read()[0]:
-                valid_indices.append(i)
-            cap.release()
-        return valid_indices
+    def setup_camera_max_resolution(self, camera_index):
+        """Configure camera for smooth preview resolution and detect max resolution capability"""
+        capture = cv2.VideoCapture(camera_index)
+        
+        if not capture.isOpened():
+            return None, (640, 480), (640, 480), 1.0
+        
+        # First, detect the maximum supported resolution (without using it)
+        resolutions_to_try = [
+            (3840, 2160),  # 4K
+            (2560, 1440),  # 1440p
+            (1920, 1080),  # 1080p
+            (1280, 720),   # 720p
+            (1024, 768),   # XGA
+            (800, 600),    # SVGA
+            (640, 480)     # VGA (fallback)
+        ]
+        
+        max_resolution = (640, 480)
+        
+        for width, height in resolutions_to_try:
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            
+            actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            if actual_width >= width * 0.9 and actual_height >= height * 0.9:
+                max_resolution = (actual_width, actual_height)
+                print(f"Camera {camera_index} max resolution detected: {actual_width}x{actual_height}")
+                break
+        
+        # Now set to a good preview resolution for smooth UI
+        preview_targets = [
+            (1280, 720),   # 720p - good balance
+            (960, 540),    # Half of 1080p
+            (800, 600),    # SVGA
+            (640, 480)     # VGA fallback
+        ]
+        
+        preview_resolution = (640, 480)
+        
+        for width, height in preview_targets:
+            if width <= max_resolution[0] and height <= max_resolution[1]:
+                capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                
+                actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                
+                if actual_width >= width * 0.9 and actual_height >= height * 0.9:
+                    preview_resolution = (actual_width, actual_height)
+                    print(f"Camera {camera_index} preview resolution: {actual_width}x{actual_height}")
+                    break
+        
+        # Calculate scale factor from preview to max resolution
+        scale_factor = max_resolution[0] / preview_resolution[0]
+        
+        # Optimize camera settings
+        capture.set(cv2.CAP_PROP_FPS, 30)
+        capture.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+        
+        try:
+            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        except:
+            pass
+        
+        return capture, max_resolution, preview_resolution, scale_factor
+
+    def debug_current_camera(self):
+        """Debug function to see current camera capabilities"""
+        camera_index = self.camera_options[self.device_dropdown.current()]
+        
+        # Show current resolution
+        if self.capture:
+            ret, frame = self.capture.read()
+            if ret:
+                current_res = f"{frame.shape[1]}x{frame.shape[0]}"
+            else:
+                current_res = "Unable to read frame"
+        else:
+            current_res = "Camera not open"
+        
+        # Test capabilities
+        capture = cv2.VideoCapture(camera_index)
+        if not capture.isOpened():
+            messagebox.showerror("Debug", f"Cannot open camera {camera_index}")
+            return
+        
+        # Get default resolution
+        default_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        default_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Test various resolutions
+        test_resolutions = [
+            (4096, 2160), (3840, 2160), (2560, 1440), 
+            (1920, 1080), (1280, 720), (800, 600), (640, 480)
+        ]
+        
+        supported_resolutions = []
+        for width, height in test_resolutions:
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            
+            actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            if actual_width > 0 and actual_height > 0:
+                supported_resolutions.append(f"{width}x{height} -> {actual_width}x{actual_height}")
+        
+        capture.release()
+        
+        debug_info = (f"Camera {camera_index} Debug Info:\n\n"
+                     f"Current Active Resolution: {current_res}\n"
+                     f"Default Resolution: {default_width}x{default_height}\n\n"
+                     f"Supported Resolutions:\n" + "\n".join(supported_resolutions))
+        
+        messagebox.showinfo("Camera Debug", debug_info)
 
     def start_preview(self):
+        """Enhanced start_preview with dual resolution system"""
         self.stop_preview()
         index = self.camera_options[self.device_dropdown.current()]
-        self.capture = cv2.VideoCapture(index)
+        
+        # Use enhanced camera setup with dual resolution
+        result = self.setup_camera_max_resolution(index)
+        if result[0] is None:
+            messagebox.showerror("Error", f"Could not open camera {index}")
+            self.resolution_label.config(text="Resolution: Error")
+            return
+        
+        self.capture, self.camera_resolution, self.preview_resolution, self.resolution_scale_factor = result
+        
+        # Update resolution display
+        if self.camera_resolution == self.preview_resolution:
+            res_text = f"Resolution: {self.camera_resolution[0]}x{self.camera_resolution[1]}"
+        else:
+            res_text = f"Resolution: {self.camera_resolution[0]}x{self.camera_resolution[1]} (preview: {self.preview_resolution[0]}x{self.preview_resolution[1]})"
+        
+        self.resolution_label.config(text=res_text)
+        print(f"Camera max resolution: {self.camera_resolution}")
+        print(f"Preview resolution: {self.preview_resolution}")
+        print(f"Scale factor: {self.resolution_scale_factor:.2f}")
+        
         self.preview_running = True
         self.update_preview()
 
@@ -95,155 +308,638 @@ class CameraSetup:
             self.capture.release()
             self.capture = None
 
+    def calculate_image_layout(self, frame):
+        """Calculate how the image should be positioned and scaled on the canvas"""
+        h, w = frame.shape[:2]
+        canvas_w, canvas_h = self.canvas_size
+        
+        # Calculate base scale to fit image in canvas
+        base_scale = min(canvas_w / w, canvas_h / h)
+        
+        # Apply zoom to the base scale
+        self.image_scale = base_scale * self.zoom_level
+        
+        # Calculate the image dimensions at current zoom
+        self.image_width = int(w * self.image_scale)
+        self.image_height = int(h * self.image_scale)
+        
+        # Calculate image position (center by default, then apply pan)
+        default_x = (canvas_w - self.image_width) // 2
+        default_y = (canvas_h - self.image_height) // 2
+        
+        # Apply pan offset
+        self.image_x = default_x + self.pan_x
+        self.image_y = default_y + self.pan_y
+        
+        # Clamp pan to reasonable bounds (allow image to be dragged partially off screen)
+        max_pan_x = self.image_width // 2
+        max_pan_y = self.image_height // 2
+        min_pan_x = -self.image_width + max_pan_x
+        min_pan_y = -self.image_height + max_pan_y
+        
+        # Only clamp if image is larger than canvas
+        if self.image_width > canvas_w:
+            self.pan_x = max(min_pan_x, min(max_pan_x, self.pan_x))
+        else:
+            self.pan_x = 0  # Center horizontally if image fits
+            
+        if self.image_height > canvas_h:
+            self.pan_y = max(min_pan_y, min(max_pan_y, self.pan_y))
+        else:
+            self.pan_y = 0  # Center vertically if image fits
+            
+        # Recalculate position with clamped pan
+        self.image_x = default_x + self.pan_x
+        self.image_y = default_y + self.pan_y
+
     def update_preview(self):
         if not self.preview_running or self.capture is None:
             return
 
-        # Only grab a new frame if not zooming/panning
-        if not self._needs_redraw:
-            ret, frame = self.capture.read()
-            if not ret or frame is None:
-                self.dialog.after(30, self.update_preview)
-                return
-            self.latest_frame = frame
-        else:
-            frame = getattr(self, "latest_frame", None)
+        ret, frame = self.capture.read()
+        if not ret or frame is None:
+            self.dialog.after(30, self.update_preview)
+            return
 
-        if frame is not None:
-            h, w = frame.shape[:2]
-            if not hasattr(self, "camera_aspect_ratio_initialized"):
-                self.camera_aspect_ratio = w / h
-                self.camera_aspect_ratio_initialized = True
+        self.latest_frame = frame
+        self.original_frame = frame.copy()
 
-            frame = self.apply_zoom_and_pan(frame)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(frame)
+        # Calculate image layout (position and scale)
+        self.calculate_image_layout(frame)
 
-            canvas_w, canvas_h = self.canvas_size
-            img_w, img_h = pil_image.size
-            ratio = min(canvas_w / img_w, canvas_h / img_h)
-            new_size = (int(img_w * ratio), int(img_h * ratio))
-            resized_image = pil_image.resize(new_size, Image.BILINEAR)  # Faster than LANCZOS for real-time
+        # Convert frame to RGB and create PIL image
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
 
-            img_tk = ImageTk.PhotoImage(resized_image)
-            self._preview_image = img_tk
+        # Resize image to display size
+        resized_image = pil_image.resize((self.image_width, self.image_height), Image.BILINEAR)
+        img_tk = ImageTk.PhotoImage(resized_image)
+        self._preview_image = img_tk
 
-            x = (canvas_w - new_size[0]) // 2
-            y = (canvas_h - new_size[1]) // 2
-            self.canvas.delete("all")
-            self.canvas.create_image(x, y, image=img_tk, anchor="nw")
+        # Clear canvas and draw image
+        self.canvas.delete("all")
+        self.canvas.create_image(self.image_x, self.image_y, image=img_tk, anchor="nw")
 
-        self._needs_redraw = False
+        # Draw crop overlay and corners
+        self.draw_crop_overlay()
+        self.update_crop_preview()
+
         self.dialog.after(30, self.update_preview)
 
+    def get_full_resolution_crop(self):
+        """Get crop at full camera resolution (for OCR processing)"""
+        if not self.corner_points:
+            return None
+        
+        try:
+            # Use a separate camera instance for full resolution capture
+            temp_capture = cv2.VideoCapture(self.camera_options[self.device_dropdown.current()])
+            if not temp_capture.isOpened():
+                print("Could not open camera for full resolution capture")
+                return None
+            
+            # Set to full resolution
+            temp_capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_resolution[0])
+            temp_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_resolution[1])
+            
+            # Give camera time to adjust and capture a frame
+            ret = False
+            for _ in range(5):  # Try a few times to get a good frame
+                ret, frame = temp_capture.read()
+                if ret and frame is not None:
+                    break
+            
+            temp_capture.release()
+            
+            if not ret or frame is None:
+                print("Could not capture full resolution frame")
+                return None
+        
+            print(f"Full resolution frame: {frame.shape[1]}x{frame.shape[0]}")
+            
+            # Use the stored corner points (already in full resolution coordinates)
+            src_points = np.array(self.corner_points, dtype=np.float32)
+            
+            # Calculate output dimensions from the quadrilateral
+            widths = [
+                np.linalg.norm(src_points[1] - src_points[0]),
+                np.linalg.norm(src_points[2] - src_points[3])
+            ]
+            heights = [
+                np.linalg.norm(src_points[3] - src_points[0]),
+                np.linalg.norm(src_points[2] - src_points[1])
+            ]
+            
+            max_width = int(max(widths))
+            max_height = int(max(heights))
+            
+            if max_width <= 0 or max_height <= 0:
+                print("Invalid crop dimensions")
+                return None
+            
+            # Define destination rectangle
+            dst_points = np.array([
+                [0, 0],
+                [max_width - 1, 0],
+                [max_width - 1, max_height - 1],
+                [0, max_height - 1]
+            ], dtype=np.float32)
+            
+            # Apply perspective transformation at full resolution
+            matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+            corrected = cv2.warpPerspective(frame, matrix, (max_width, max_height))
+            
+            print(f"Cropped region: {corrected.shape[1]}x{corrected.shape[0]}")
+            return corrected
+            
+        except Exception as e:
+            print(f"Error in get_full_resolution_crop: {e}")
+            return None
 
-    def apply_zoom_and_pan(self, frame):
-        h, w = frame.shape[:2]
-        zoomed_w, zoomed_h = int(w / self.zoom_level), int(h / self.zoom_level)
+    def draw_crop_overlay(self):
+        """Draw the 4-corner crop area and corner handles"""
+        # If we're in creating mode, draw the preview rectangle
+        if self.crop_mode == "creating" and hasattr(self, 'current_drag_end'):
+            x1, y1 = self.drag_start
+            x2, y2 = self.current_drag_end
+            
+            # Draw preview rectangle
+            self.canvas.create_rectangle(
+                x1, y1, x2, y2,
+                outline="lime", width=2, fill="", stipple="gray50"
+            )
+            return
+        
+        if not self.corner_points:
+            return
 
-        max_x = w - zoomed_w
-        max_y = h - zoomed_h
+        # Convert image coordinates to canvas coordinates
+        canvas_corners = []
+        for img_x, img_y in self.corner_points:
+            canvas_coords = self.image_to_canvas_coords(img_x, img_y)
+            if canvas_coords:
+                canvas_corners.append(canvas_coords)
+            else:
+                return
 
-        x1 = min(max(self.pan_x, 0), max_x)
-        y1 = min(max(self.pan_y, 0), max_y)
-        x2 = x1 + zoomed_w
-        y2 = y1 + zoomed_h
+        self.canvas_corners = canvas_corners
 
-        # Save corrected values in case they were clamped
-        self.pan_x = x1
-        self.pan_y = y1
+        # Draw crop area outline
+        if len(canvas_corners) == 4:
+            for i in range(4):
+                x1, y1 = canvas_corners[i]
+                x2, y2 = canvas_corners[(i + 1) % 4]
+                self.canvas.create_line(x1, y1, x2, y2, fill="lime", width=2)
 
-        return frame[y1:y2, x1:x2]
+        # Draw corner handles
+        for i, (x, y) in enumerate(canvas_corners):
+            color = "red" if i == self.selected_corner else "yellow"
+            self.canvas.create_oval(
+                x - self.corner_radius, y - self.corner_radius,
+                x + self.corner_radius, y + self.corner_radius,
+                fill=color, outline="white", width=2
+            )
+            self.canvas.create_text(x, y - 15, text=str(i+1), fill="white", font=("Arial", 10, "bold"))
 
+    def image_to_canvas_coords(self, img_x, img_y):
+        """Convert full resolution image coordinates to canvas coordinates"""
+        # Scale down from full resolution to preview resolution
+        preview_x = img_x / self.resolution_scale_factor
+        preview_y = img_y / self.resolution_scale_factor
+        
+        # Then scale from preview to canvas display size
+        canvas_x = self.image_x + (preview_x * self.image_scale)
+        canvas_y = self.image_y + (preview_y * self.image_scale)
+        return (canvas_x, canvas_y)
+
+    def canvas_to_image_coords(self, canvas_x, canvas_y):
+        """Convert canvas coordinates to original image coordinates (at full resolution)"""
+        if not hasattr(self, 'image_scale') or self.image_scale == 0:
+            return None
+            
+        # Convert from canvas to preview image coordinates
+        preview_img_x = (canvas_x - self.image_x) / self.image_scale
+        preview_img_y = (canvas_y - self.image_y) / self.image_scale
+        
+        # Scale up to full resolution coordinates
+        full_img_x = preview_img_x * self.resolution_scale_factor
+        full_img_y = preview_img_y * self.resolution_scale_factor
+        
+        # Clamp to full resolution image bounds
+        full_img_x = max(0, min(self.camera_resolution[0] - 1, full_img_x))
+        full_img_y = max(0, min(self.camera_resolution[1] - 1, full_img_y))
+            
+        return (int(full_img_x), int(full_img_y))
 
     def on_mouse_wheel(self, event):
+        """Handle zoom with mouse wheel"""
+        if not hasattr(self, "latest_frame"):
+            return
+            
         old_zoom = self.zoom_level
         delta = 0.1 if event.delta > 0 else -0.1
-        new_zoom = max(1.0, min(5.0, old_zoom + delta))
+        new_zoom = max(1.0, min(10.0, old_zoom + delta))
 
-        if new_zoom == old_zoom or not hasattr(self, "latest_frame"):
+        if new_zoom == old_zoom:
             return
 
-        # Get actual image size (full resolution)
-        frame_h, frame_w = self.latest_frame.shape[:2]
-
-        # Get canvas and image display size
-        canvas_w, canvas_h = self.canvas_size
-        visible_w = int(frame_w / old_zoom)
-        visible_h = int(frame_h / old_zoom)
-
-        # Determine image position in canvas (for centering)
-        scale_ratio = min(canvas_w / visible_w, canvas_h / visible_h)
-        display_w = int(visible_w * scale_ratio)
-        display_h = int(visible_h * scale_ratio)
-        offset_x = (canvas_w - display_w) // 2
-        offset_y = (canvas_h - display_h) // 2
-
-        # Get mouse position relative to image on canvas
-        mouse_x = event.x - offset_x
-        mouse_y = event.y - offset_y
-
-        if mouse_x < 0 or mouse_y < 0 or mouse_x >= display_w or mouse_y >= display_h:
-            # Outside image bounds — zoom without changing pan
+        # Calculate zoom center point (mouse position in image coordinates)
+        mouse_img_coords = self.canvas_to_image_coords(event.x, event.y)
+        if mouse_img_coords:
+            # Store the point we want to zoom towards
+            zoom_center_img_x, zoom_center_img_y = mouse_img_coords
+            
+            # Calculate where this point is currently on the canvas
+            old_canvas_x, old_canvas_y = self.image_to_canvas_coords(zoom_center_img_x, zoom_center_img_y)
+            
+            # Update zoom level
             self.zoom_level = new_zoom
-            self._needs_redraw = True
-            return
+            
+            # Recalculate layout with new zoom
+            self.calculate_image_layout(self.latest_frame)
+            
+            # Calculate where the zoom center point would be with new zoom
+            new_canvas_x, new_canvas_y = self.image_to_canvas_coords(zoom_center_img_x, zoom_center_img_y)
+            
+            # Adjust pan to keep the zoom center point under the mouse
+            self.pan_x += (old_canvas_x - new_canvas_x)
+            self.pan_y += (old_canvas_y - new_canvas_y)
+        else:
+            # If mouse is outside image, just zoom normally
+            self.zoom_level = new_zoom
 
-        # Map canvas mouse position to image coordinate (before zoom)
-        rel_x = mouse_x / display_w
-        rel_y = mouse_y / display_h
-        image_x = self.pan_x + int(rel_x * visible_w)
-        image_y = self.pan_y + int(rel_y * visible_h)
-
-        # Calculate new pan so image_x/image_y stays under cursor after zoom
-        new_visible_w = int(frame_w / new_zoom)
-        new_visible_h = int(frame_h / new_zoom)
-        self.pan_x = image_x - int(rel_x * new_visible_w)
-        self.pan_y = image_y - int(rel_y * new_visible_h)
-
-        # Clamp pan
-        self.pan_x = max(0, min(self.pan_x, frame_w - new_visible_w))
-        self.pan_y = max(0, min(self.pan_y, frame_h - new_visible_h))
-
-        self.zoom_level = new_zoom
+        # Update zoom display
+        zoom_percent = int(new_zoom * 100)
+        self.zoom_label.config(text=f"{zoom_percent}%")
         self.zoom_slider.set(new_zoom)
-        self._needs_redraw = True
 
-    def on_mouse_press(self, event):
+    def on_mouse_press_left(self, event):
+        """Handle left mouse press for crop creation or corner adjustment"""
+        # Check if clicking on existing corner
+        if self.canvas_corners:
+            for i, (cx, cy) in enumerate(self.canvas_corners):
+                if self.point_distance(event.x, event.y, cx, cy) <= self.corner_radius:
+                    self.selected_corner = i
+                    self.crop_mode = "adjusting"
+                    return
+
+        # If no crop exists, start creating one
+        if not self.corner_points:
+            self.crop_mode = "creating"
+            self.drag_start = (event.x, event.y)
+            self.current_drag_end = (event.x, event.y)
+
+    def on_mouse_drag_left(self, event):
+        """Handle mouse drag for crop creation or corner adjustment"""
+        if self.crop_mode == "creating":
+            # Show live preview while creating crop
+            self.current_drag_end = (event.x, event.y)
+        elif self.crop_mode == "adjusting" and self.selected_corner is not None:
+            # Adjust selected corner
+            img_coords = self.canvas_to_image_coords(event.x, event.y)
+            if img_coords:
+                self.corner_points[self.selected_corner] = img_coords
+
+    def on_mouse_release_left(self, event):
+        """Handle mouse release for crop creation"""
+        if self.crop_mode == "creating":
+            # Create initial 4-corner rectangle from drag
+            start_img = self.canvas_to_image_coords(self.drag_start[0], self.drag_start[1])
+            end_img = self.canvas_to_image_coords(event.x, event.y)
+            
+            if start_img and end_img:
+                x1, y1 = start_img
+                x2, y2 = end_img
+                
+                # Ensure proper ordering
+                min_x, max_x = min(x1, x2), max(x1, x2)
+                min_y, max_y = min(y1, y2), max(y1, y2)
+                
+                # Create 4 corners in clockwise order
+                self.corner_points = [
+                    (min_x, min_y),  # top-left
+                    (max_x, min_y),  # top-right
+                    (max_x, max_y),  # bottom-right
+                    (min_x, max_y)   # bottom-left
+                ]
+                self.crop_mode = "none"
+                # Clear the drag preview
+                self.current_drag_end = None
+                # Auto-save when crop is created
+                self.auto_save_on_changes()
+        elif self.crop_mode == "adjusting":
+            self.crop_mode = "none"
+            # Auto-save when crop is adjusted
+            self.auto_save_on_changes()
+        
+        self.selected_corner = None
+
+    def on_mouse_press_middle(self, event):
+        """Start panning operation"""
         self.drag_start = (event.x, event.y)
+        self.canvas.config(cursor="fleur")
 
-    def on_mouse_drag(self, event):
+    def on_mouse_drag_middle(self, event):
+        """Handle panning with middle/right mouse button"""
+        if not hasattr(self, "drag_start"):
+            return
+            
+        # Calculate how much the mouse moved
         dx = event.x - self.drag_start[0]
         dy = event.y - self.drag_start[1]
         self.drag_start = (event.x, event.y)
 
-        if not hasattr(self, "latest_frame"):
+        # Update pan offset
+        self.pan_x += dx
+        self.pan_y += dy
+
+    def on_mouse_release_middle(self, event):
+        """End panning operation"""
+        self.canvas.config(cursor="")
+
+    def point_distance(self, x1, y1, x2, y2):
+        """Calculate distance between two points"""
+        return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+
+    def update_crop_preview(self):
+        """Update crop preview with perspective correction using preview resolution"""
+        if not self.corner_points or not hasattr(self, "original_frame"):
+            self.crop_preview.configure(image="", text="Draw crop area around timer")
             return
 
-        frame_h, frame_w = self.latest_frame.shape[:2]
-        visible_w = int(frame_w / self.zoom_level)
-        visible_h = int(frame_h / self.zoom_level)
+        try:
+            # Convert full-resolution crop coordinates to preview resolution
+            preview_corners = []
+            for full_x, full_y in self.corner_points:
+                preview_x = full_x / self.resolution_scale_factor
+                preview_y = full_y / self.resolution_scale_factor
+                preview_corners.append((preview_x, preview_y))
+            
+            src_points = np.array(preview_corners, dtype=np.float32)
+            
+            # Calculate output dimensions
+            widths = [
+                np.linalg.norm(src_points[1] - src_points[0]),
+                np.linalg.norm(src_points[2] - src_points[3])
+            ]
+            heights = [
+                np.linalg.norm(src_points[3] - src_points[0]),
+                np.linalg.norm(src_points[2] - src_points[1])
+            ]
+            
+            max_width = int(max(widths))
+            max_height = int(max(heights))
+            
+            if max_width <= 0 or max_height <= 0:
+                self.crop_preview.configure(image="", text="Invalid crop dimensions")
+                return
+            
+            # Define destination points for a perfect rectangle
+            dst_points = np.array([
+                [0, 0],
+                [max_width - 1, 0],
+                [max_width - 1, max_height - 1],
+                [0, max_height - 1]
+            ], dtype=np.float32)
+            
+            # Calculate perspective transformation matrix
+            matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+            
+            # Apply perspective transformation on preview resolution frame
+            corrected = cv2.warpPerspective(
+                self.original_frame, 
+                matrix, 
+                (max_width, max_height)
+            )
+            
+            if corrected.size == 0:
+                self.crop_preview.configure(image="", text="Invalid crop region")
+                return
+            
+            # Convert BGR to RGB
+            corrected_rgb = cv2.cvtColor(corrected, cv2.COLOR_BGR2RGB)
+            pil_corrected = Image.fromarray(corrected_rgb)
+            
+            # Resize for preview maintaining aspect ratio
+            crop_w, crop_h = pil_corrected.size
+            max_w, max_h = 380, 180
+            
+            ratio = min(max_w / crop_w, max_h / crop_h)
+            new_w = int(crop_w * ratio)
+            new_h = int(crop_h * ratio)
+            
+            if new_w > 0 and new_h > 0:
+                preview_image = pil_corrected.resize((new_w, new_h), Image.LANCZOS)
+                crop_tk = ImageTk.PhotoImage(preview_image)
+                
+                self.crop_preview.configure(image=crop_tk, text="")
+                self.crop_preview.image = crop_tk
+            else:
+                self.crop_preview.configure(image="", text="Invalid preview size")
+            
+        except Exception as e:
+            self.crop_preview.configure(image="", text=f"Preview error: {str(e)}")
+            print(f"Crop preview error: {e}")
 
-        # Scale drag distance by visible image size vs canvas size
-        canvas_w, canvas_h = self.canvas_size
-        scale_x = visible_w / canvas_w
-        scale_y = visible_h / canvas_h
+    def load_config(self):
+        """Load configuration from file"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    print(f"Loaded config: {config}")
+                    return config
+        except Exception as e:
+            print(f"Error loading config: {e}")
+        return None
 
-        # Apply scaled pan movement
-        self.pan_x -= int(dx * scale_x)
-        self.pan_y -= int(dy * scale_y)
+    def save_config(self):
+        """Save current configuration to file"""
+        try:
+            config = {
+                'camera_index': self.camera_options[self.device_dropdown.current()],
+                'camera_name': self.camera_names[self.device_dropdown.current()],
+                'camera_resolution': self.camera_resolution,
+                'preview_resolution': self.preview_resolution,
+                'resolution_scale_factor': self.resolution_scale_factor,
+                'crop_corners': self.corner_points,
+                'zoom_level': self.zoom_level,
+                'pan_x': self.pan_x,
+                'pan_y': self.pan_y
+            }
+            
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            messagebox.showinfo("Config Saved", f"Configuration saved to {self.config_file}")
+            print(f"Saved config: {config}")
+            
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save config: {str(e)}")
 
-        # Clamp to bounds
-        self.pan_x = max(0, min(self.pan_x, frame_w - visible_w))
-        self.pan_y = max(0, min(self.pan_y, frame_h - visible_h))
+    def apply_saved_config(self, config):
+        """Apply saved configuration to UI"""
+        try:
+            # Find matching camera by name first, fall back to index
+            saved_camera_name = config.get('camera_name', '')
+            saved_camera_index = config.get('camera_index', 0)
+            
+            # Try to find camera by name first (more reliable)
+            camera_found = False
+            for i, name in enumerate(self.camera_names):
+                if name == saved_camera_name:
+                    self.device_dropdown.current(i)
+                    camera_found = True
+                    print(f"Found camera by name: {name} at index {i}")
+                    break
+            
+            # If not found by name, try by index
+            if not camera_found and 0 <= saved_camera_index < len(self.camera_names):
+                self.device_dropdown.current(saved_camera_index)
+                camera_found = True
+                print(f"Found camera by index: {saved_camera_index}")
+            
+            if not camera_found:
+                print(f"Saved camera not found, using default")
+                self.device_dropdown.current(0)
+            
+            # Apply crop corners if they exist
+            if config.get('crop_corners'):
+                self.corner_points = config['crop_corners']
+                print(f"Restored crop corners: {self.corner_points}")
+            
+            # Apply zoom and pan settings (check if UI elements exist)
+            if 'zoom_level' in config and hasattr(self, 'zoom_slider'):
+                self.zoom_level = config['zoom_level']
+                self.zoom_slider.set(self.zoom_level)
+                if hasattr(self, 'zoom_label'):
+                    zoom_percent = int(self.zoom_level * 100)
+                    self.zoom_label.config(text=f"{zoom_percent}%")
+            elif 'zoom_level' in config:
+                # Store for later application
+                self.zoom_level = config['zoom_level']
+            
+            if 'pan_x' in config:
+                self.pan_x = config['pan_x']
+            
+            if 'pan_y' in config:
+                self.pan_y = config['pan_y']
+                
+            # Show saved resolution if available
+            saved_resolution = config.get('camera_resolution', 'Unknown')
+            
+            messagebox.showinfo("Config Loaded", 
+                f"Loaded saved configuration:\n"
+                f"Camera: {saved_camera_name}\n"
+                f"Resolution: {saved_resolution[0]}x{saved_resolution[1]} (saved)\n"
+                f"Crop: {'Yes' if self.corner_points else 'No'}\n"
+                f"Zoom: {int(self.zoom_level * 100)}%")
+                
+        except Exception as e:
+            print(f"Error applying config: {e}")
+            messagebox.showwarning("Config Error", f"Could not fully apply saved config: {str(e)}")
 
-        self._needs_redraw = True
+    def load_and_apply_config(self):
+        """Manually load and apply configuration"""
+        config = self.load_config()
+        if config:
+            self.apply_saved_config(config)
+            # Restart preview with new settings
+            self.start_preview()
+        else:
+            messagebox.showinfo("No Config", "No saved configuration found.")
+
+    def auto_save_on_changes(self):
+        """Auto-save configuration when important changes are made"""
+        if hasattr(self, 'corner_points') and self.corner_points:
+            try:
+                config = {
+                    'camera_index': self.camera_options[self.device_dropdown.current()],
+                    'camera_name': self.camera_names[self.device_dropdown.current()],
+                    'camera_resolution': self.camera_resolution,
+                    'preview_resolution': self.preview_resolution,
+                    'resolution_scale_factor': self.resolution_scale_factor,
+                    'crop_corners': self.corner_points,
+                    'zoom_level': self.zoom_level,
+                    'pan_x': self.pan_x,
+                    'pan_y': self.pan_y
+                }
+                
+                with open(self.config_file, 'w') as f:
+                    json.dump(config, f, indent=2)
+                    
+                print("Auto-saved configuration")
+                
+            except Exception as e:
+                print(f"Auto-save failed: {e}")
+
+    def clear_crop(self):
+        """Clear the current crop selection"""
+        self.corner_points = None
+        self.canvas_corners = None
+        self.selected_corner = None
+        self.crop_mode = "none"
+        self.crop_preview.configure(image="", text="Draw crop area around timer")
+
+    def reset_to_rectangle(self):
+        """Reset crop to a perfect rectangle based on current corners"""
+        if not self.corner_points:
+            return
+        
+        xs = [p[0] for p in self.corner_points]
+        ys = [p[1] for p in self.corner_points]
+        
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        
+        self.corner_points = [
+            (min_x, min_y),
+            (max_x, min_y),
+            (max_x, max_y),
+            (min_x, max_y)
+        ]
+        
+        # Auto-save when crop is reset
+        self.auto_save_on_changes()
+
+    def on_next_ocr(self):
+        """Proceed to OCR setup with current camera and crop settings"""
+        if not self.corner_points:
+            messagebox.showwarning("No Crop", "Please create a crop area around the timer first.")
+            return
+            
+        camera_index = self.camera_options[self.device_dropdown.current()]
+        crop_corners = self.corner_points.copy()  # Make a copy
+        self.stop_preview()
+        self.dialog.destroy()
+        
+        # Import and run OCR setup with the same parent
+        try:
+            # Try relative import first (when run as module)
+            try:
+                from .ocr_setup import OCRSetup
+            except ImportError:
+                # Fall back to absolute import (when run directly)
+                from ocr_setup import OCRSetup
+            
+            # Create OCR setup with the same parent root
+            ocr_app = OCRSetup(self.parent, camera_index, crop_corners)
+            self.parent.wait_window(ocr_app.dialog)
+            
+        except ImportError as e:
+            messagebox.showerror("Error", f"ocr_setup.py not found: {str(e)}\nPlease make sure it's in the same directory.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start OCR setup: {str(e)}")
 
     def on_select(self):
         self.selected_index = self.camera_options[self.device_dropdown.current()]
         self.stop_preview()
         self.dialog.destroy()
-        messagebox.showinfo("Camera Selected", f"Camera {self.selected_index} selected.")
+        
+        crop_info = ""
+        if self.corner_points:
+            crop_info = f"\nTimer crop corners: {self.corner_points}"
+        messagebox.showinfo("Camera Selected", f"Camera {self.selected_index} selected.\nResolution: {self.camera_resolution[0]}x{self.camera_resolution[1]}{crop_info}")
 
     def on_cancel(self):
         self.selected_index = None
@@ -254,17 +950,11 @@ class CameraSetup:
         if event.width < 50 or event.height < 50:
             return
         self.canvas_size = (event.width, event.height)
-        if not hasattr(self, "_resize_pending"):
-            self._resize_pending = True
-            self.dialog.after(100, self._finish_resize)
-
-    def _finish_resize(self):
-        self._resize_pending = False
 
     def on_zoom_slider(self, value):
         self.zoom_level = float(value)
-        self._needs_redraw = True
-
+        zoom_percent = int(self.zoom_level * 100)
+        self.zoom_label.config(text=f"{zoom_percent}%")
 
 
 def run_camera_setup() -> Optional[int]:
