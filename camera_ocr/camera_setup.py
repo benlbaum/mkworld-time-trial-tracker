@@ -275,18 +275,45 @@ class CameraSetup:
         messagebox.showinfo("Camera Debug", debug_info)
 
     def start_preview(self):
-        """Enhanced start_preview with dual resolution system"""
+        """Enhanced start_preview with resolution optimization"""
         self.stop_preview()
         index = self.camera_options[self.device_dropdown.current()]
         
-        # Use enhanced camera setup with dual resolution
-        result = self.setup_camera_max_resolution(index)
-        if result[0] is None:
-            messagebox.showerror("Error", f"Could not open camera {index}")
-            self.resolution_label.config(text="Resolution: Error")
-            return
-        
-        self.capture, self.camera_resolution, self.preview_resolution, self.resolution_scale_factor = result
+        # Check if we have saved resolution settings
+        saved_config = self.load_config()
+        if saved_config and 'camera_resolution' in saved_config:
+            # Use saved resolution directly - much faster!
+            self.camera_resolution = tuple(saved_config['camera_resolution'])
+            if 'preview_resolution' in saved_config:
+                self.preview_resolution = tuple(saved_config['preview_resolution'])
+            else:
+                self.preview_resolution = (1280, 720)  # Default fallback
+            
+            if 'resolution_scale_factor' in saved_config:
+                self.resolution_scale_factor = saved_config['resolution_scale_factor']
+            else:
+                self.resolution_scale_factor = self.camera_resolution[0] / self.preview_resolution[0]
+            
+            # Set up camera with saved settings
+            self.capture = cv2.VideoCapture(index)
+            if self.capture and self.capture.isOpened():
+                # Directly set the preview resolution
+                self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.preview_resolution[0])
+                self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.preview_resolution[1])
+                print(f"Using saved camera resolution: {self.camera_resolution}")
+                print(f"Using saved preview resolution: {self.preview_resolution}")
+            else:
+                messagebox.showerror("Error", f"Could not open camera {index}")
+                return
+        else:
+            # No saved config - do full resolution detection (slower)
+            result = self.setup_camera_max_resolution(index)
+            if result[0] is None:
+                messagebox.showerror("Error", f"Could not open camera {index}")
+                self.resolution_label.config(text="Resolution: Error")
+                return
+            
+            self.capture, self.camera_resolution, self.preview_resolution, self.resolution_scale_factor = result
         
         # Update resolution display
         if self.camera_resolution == self.preview_resolution:
@@ -295,9 +322,6 @@ class CameraSetup:
             res_text = f"Resolution: {self.camera_resolution[0]}x{self.camera_resolution[1]} (preview: {self.preview_resolution[0]}x{self.preview_resolution[1]})"
         
         self.resolution_label.config(text=res_text)
-        print(f"Camera max resolution: {self.camera_resolution}")
-        print(f"Preview resolution: {self.preview_resolution}")
-        print(f"Scale factor: {self.resolution_scale_factor:.2f}")
         
         self.preview_running = True
         self.update_preview()
@@ -915,15 +939,10 @@ class CameraSetup:
         
         # Import and run OCR setup with the same parent
         try:
-            # Try relative import first (when run as module)
-            try:
-                from .ocr_setup import OCRSetup
-            except ImportError:
-                # Fall back to absolute import (when run directly)
-                from ocr_setup import OCRSetup
-            
+            from .robust_timer_ocr import RobustTimerOCRSetup
+        
             # Create OCR setup with the same parent root
-            ocr_app = OCRSetup(self.parent, camera_index, crop_corners)
+            ocr_app = RobustTimerOCRSetup(self.parent, camera_index, crop_corners)
             self.parent.wait_window(ocr_app.dialog)
             
         except ImportError as e:
